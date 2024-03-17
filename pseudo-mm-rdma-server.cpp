@@ -1,10 +1,16 @@
 // This is originated by fastswap rmserver !
 #include <cassert>
+#include <cstring>
 #include <rdma/rdma_cma.h>
-#include <string.h>
+#include <sys/epoll.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/sysinfo.h>
+#include <sys/un.h>
+#include <thread>
 
 #include "pseudo-mm-rdma-server.h"
+#include "scm.h"
 
 int RDMAQueue::create_qp() {
   if (!this->client_cm_id) {
@@ -39,8 +45,8 @@ int RDMAServer::init(uint16_t port_num) {
     return 1;
   if (REPORT_IF_ZERO(buffer = new uint8_t[BUFFER_SIZE]))
     return 1;
-  if (REPORT_IF_NONZERO(fill_buffer_poll()))
-    return 1;
+  // if (REPORT_IF_NONZERO(fill_buffer_poll()))
+  //   return 1;
   for (int i = 0; i < queue_num; i++) {
     queues[i].srv = this;
   }
@@ -55,6 +61,13 @@ int RDMAServer::init(uint16_t port_num) {
   uint16_t port = ntohs(rdma_get_src_port(srv_cm_id));
   printf("RDMA server listening on port %d, queue num = %d.\n", port,
          queue_num);
+  // start a server to load memory image
+  std::thread t([this] {
+    if (REPORT_IF_NONZERO(__init_buf_sock()))
+      return;
+    REPORT_IF_NONZERO(__serve_buf_sock());
+  });
+  t.detach();
   return 0;
 }
 
@@ -379,6 +392,198 @@ int RDMAServer::fill_buffer_poll() {
   for (unsigned long i = 0; i < (BUFFER_SIZE / PAGE_SIZE); i++) {
     fill_start = (char *)buffer + i * PAGE_SIZE;
     fill_single_page(fill_start, SEED);
+  }
+  return 0;
+}
+
+static int uds_listen(int sock, struct sockaddr_un *saddr) {
+  int len;
+  unlink(saddr->sun_path);
+
+  len = offsetof(struct sockaddr_un, sun_path) + strlen(saddr->sun_path);
+  if (bind(sock, (struct sockaddr *)(saddr), len) < 0) {
+    fprintf(stderr, "error (%s, line %d): bind buf socket error\n", __FILE__,
+            __LINE__);
+    goto out;
+  }
+
+  if (listen(sock, 10) < 0) {
+    fprintf(stderr, "error (%s, line %d): listen buf socket error\n", __FILE__,
+            __LINE__);
+    goto out;
+  }
+
+  return 0;
+
+out:
+  close(sock);
+  return -1;
+}
+
+int RDMAServer::__init_buf_sock() {
+  int sock, epoll_fd;
+  struct sockaddr_un saddr;
+  unsigned long len;
+
+  // first prepare address
+  memset(&saddr, 0, sizeof(struct sockaddr_un));
+  saddr.sun_family = AF_UNIX;
+  len = snprintf(saddr.sun_path, sizeof(saddr.sun_path), "%s", BUF_SOCK_ADDR);
+  if (len >= sizeof(saddr.sun_path)) {
+    fprintf(stderr, "Wrong UNIX socket name: %s\n", BUF_SOCK_ADDR);
+    return -1;
+  }
+
+  if ((sock = socket(AF_UNIX, SOCK_STREAM, 0)) < 0) {
+    fprintf(stderr, "error: create buf socket failed\n");
+    return -1;
+  }
+  if (uds_listen(sock, &saddr))
+    return -1;
+  this->buf_sock_fd = sock;
+
+  // setup epoll fd
+  if (REPORT_IF_TRUE((epoll_fd = epoll_create(20)) < 0))
+    return -1;
+  this->buf_sock_epoll_fd = epoll_fd;
+  return 0;
+}
+
+int RDMAServer::__serve_buf_sock() {
+  int client_fd;
+  struct sockaddr_in saddr;
+  socklen_t sock_len;
+  struct epoll_event event;
+  // swapn a thread to poll epoll fd
+  std::thread t(&RDMAServer::__epoll_buf_sock, this);
+  t.detach();
+
+  printf("buf sock ready to accept connections...\n");
+
+  while (true) {
+    client_fd = accept(buf_sock_fd, (struct sockaddr *)&saddr, &sock_len);
+    if (REPORT_IF_TRUE(client_fd < 0))
+      return -1;
+
+    printf("new buf sock client connected: %d\n", client_fd);
+    // add to epoll fd
+    event.events = EPOLLIN | EPOLLRDHUP;
+    event.data.fd = client_fd;
+    if (REPORT_IF_NONZERO(
+            epoll_ctl(buf_sock_epoll_fd, EPOLL_CTL_ADD, client_fd, &event)))
+      return -1;
+  }
+  return 0;
+}
+
+int RDMAServer::__epoll_buf_sock() {
+  struct epoll_event ready_events[10];
+  int nr_events, client_fd, cmd, ret, img_fd;
+  unsigned long pgoff;
+  while (true) {
+    nr_events = epoll_wait(buf_sock_epoll_fd, ready_events, 10, -1);
+    if (REPORT_IF_TRUE(nr_events < 0))
+      return -1;
+    for (int i = 0; i < nr_events; i++) {
+      client_fd = ready_events[i].data.fd;
+      // first recv command
+      // then recv image
+      if (ready_events[i].events | EPOLLIN) {
+        ret = recv(client_fd, &cmd, sizeof(cmd), 0);
+        if (ret == 0)
+          continue;
+        if (REPORT_IF_TRUE(ret != sizeof(cmd)))
+          return -1;
+        switch (cmd) {
+        case BUF_SOCK_MAP:
+          if (REPORT_IF_NONZERO(
+                  recv_fds(client_fd, &img_fd, 1, &pgoff, sizeof(pgoff))))
+            return -1;
+          if (REPORT_IF_NONZERO(__copy_img_to_buffer_poll(img_fd, pgoff)))
+            return -1;
+          break;
+        default:
+          fprintf(stderr, "recv unsupport command %d\n", cmd);
+          return -1;
+        }
+      }
+      if (ready_events[i].events & (EPOLLHUP | EPOLLRDHUP)) {
+        printf("close client buf_sock %d\n", client_fd);
+        if (REPORT_IF_NONZERO(
+                epoll_ctl(buf_sock_epoll_fd, EPOLL_CTL_DEL, client_fd, NULL)))
+          return -1;
+        close(client_fd);
+      }
+    }
+  }
+  return 0;
+}
+
+static int get_path_of_fd(int fd, char *buf, int buf_size) {
+  char path[1024];
+  pid_t pid = getpid();
+  int ret;
+  sprintf(path, "/proc/%d/fd/%d", pid, fd);
+  ret = readlink(path, buf, buf_size);
+  if (ret < 0)
+    return -errno;
+  return 0;
+}
+
+// only one thread (i.e., epoll thread) will execute this
+// no need to add locks for buffer
+int RDMAServer::__copy_img_to_buffer_poll(int img_fd, unsigned long pgoff) {
+  struct stat stat_buf;
+  unsigned long total, nr_read = 0;
+  char filepath_buf[1024];
+  if (img_fd < 0) {
+    fprintf(stderr, "get invalid file descriptor: %d\n", img_fd);
+    return -1;
+  }
+  if (REPORT_IF_NONZERO(fstat(img_fd, &stat_buf)))
+    return -1;
+  total = stat_buf.st_size;
+  if (total & (PAGE_SIZE - 1))
+    printf("WARNING: get image size not aligned to page size: %ld\n", total);
+  if (BUFFER_SIZE < (pgoff * PAGE_SIZE + total)) {
+    fprintf(
+        stderr,
+        "buffer not enough: current size = %ld, pgoff = %ld, img_size = %ld\n",
+        BUFFER_SIZE, pgoff, total);
+    return -1;
+  }
+
+  if (REPORT_IF_NONZERO(get_path_of_fd(img_fd, filepath_buf, 1024)))
+    return -1;
+
+  // make sure we are copying from beginning
+  //
+  // Linux manual lseek(2):
+  // Upon successful completion, lseek() returns the resulting offset
+  // location as measured in bytes from the beginning of the file.  On
+  // error, the value (off_t) -1 is returned and errno is set to
+  // indicate the error.
+  if (REPORT_IF_NONZERO(lseek(img_fd, 0, SEEK_SET)))
+    return -1;
+  printf("begin to copy image %s (size %ld bytes) to pgoff %ld\n", filepath_buf,
+         total, pgoff);
+  uint8_t *start = buffer + (pgoff * PAGE_SIZE);
+  while (true) {
+    int n = read(img_fd, start, total - nr_read);
+    if (n == 0)
+      break;
+    if (n < 0) {
+      fprintf(stderr, "read from image failed: %d\n", errno);
+      return -1;
+    }
+    nr_read += n;
+    start += n;
+  }
+  if (nr_read != total) {
+    fprintf(stderr,
+            "copy image size not enough: %ld(expected) vs %ld(actual)\n", total,
+            nr_read);
+    return -1;
   }
   return 0;
 }

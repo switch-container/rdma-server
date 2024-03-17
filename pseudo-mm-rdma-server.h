@@ -1,10 +1,10 @@
 #ifndef _PSEUDO_MM_RDMA_SERVER_H_
 #define _PSEUDO_MM_RDMA_SERVER_H_
 
+#include <cerrno>
 #include <cstdint>
-#include <errno.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <cstdio>
+#include <cstdlib>
 #include <unistd.h>
 
 #define REPORT_IF_ZERO(x)                                                      \
@@ -12,7 +12,9 @@
     bool ____ret = !(x);                                                       \
     do {                                                                       \
       if (____ret)                                                             \
-        fprintf(stderr, "error: " #x "failed (return zero/null).\n");          \
+        fprintf(stderr,                                                        \
+                "error (%s, line %d): " #x " failed (return zero/null).\n",    \
+                __FILE__, __LINE__);                                           \
       fflush(stderr);                                                          \
     } while (0);                                                               \
     ____ret;                                                                   \
@@ -23,15 +25,25 @@
     bool ____ret = (x);                                                        \
     do {                                                                       \
       if (____ret)                                                             \
-        fprintf(stderr, "error: " #x "failed (return non-zero).\n");           \
+        fprintf(stderr,                                                        \
+                "error (%s, line %d): " #x " failed (return non-zero).\n",     \
+                __FILE__, __LINE__);                                           \
       fflush(stderr);                                                          \
     } while (0);                                                               \
     ____ret;                                                                   \
   })
 
+#define REPORT_IF_TRUE(x) REPORT_IF_NONZERO(x)
+#define REPORT_IF_FALSE(x) REPORT_IF_ZERO(x)
+
 #define PAGE_SIZE (1 << 12)
 #define GB (1UL << 30)
-#define BUFFER_SIZE (1 * GB)
+#define BUFFER_SIZE (4 * GB)
+#define BUF_SOCK_ADDR "/run/pseudo-mm-rdma-server-buf.sock"
+
+enum : int {
+  BUF_SOCK_MAP = 0x1,
+};
 
 const unsigned long SEED = 0xabcabc;
 
@@ -85,6 +97,14 @@ protected:
   int __handle_disconnect(struct rdma_cm_id *client_cm_id);
   int __poll_for_mr_send();
   int __get_connected_queue_num() const;
+  // The buffer socket is used to fill the buffer pool with the memory  image
+  // as the criu will send pages image fd through this socket along with the
+  // page offset.
+  // We start a new thread to handle the buf socket
+  int __init_buf_sock();
+  int __serve_buf_sock();
+  int __epoll_buf_sock();
+  int __copy_img_to_buffer_poll(int img_fd, unsigned long pgoff);
 
   RDMAQueue *queues = nullptr;
   int queue_num;
@@ -98,6 +118,10 @@ protected:
   struct rdma_event_channel *ec = nullptr;
   struct rdma_cm_id *srv_cm_id = nullptr;
   struct ibv_cq *cq = nullptr;
+
+  // buffer socket
+  int buf_sock_fd = -1;
+  int buf_sock_epoll_fd = -1;
 };
 
 #endif
