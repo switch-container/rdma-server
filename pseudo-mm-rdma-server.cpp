@@ -478,7 +478,7 @@ int RDMAServer::__serve_buf_sock() {
 
 int RDMAServer::__epoll_buf_sock() {
   struct epoll_event ready_events[10];
-  int nr_events, client_fd, cmd, ret, img_fd;
+  int nr_events, client_fd, cmd, ret, img_fd, ack = 0;
   unsigned long pgoff;
   while (true) {
     nr_events = epoll_wait(buf_sock_epoll_fd, ready_events, 10, -1);
@@ -488,10 +488,11 @@ int RDMAServer::__epoll_buf_sock() {
       client_fd = ready_events[i].data.fd;
       // first recv command
       // then recv image
-      if (ready_events[i].events | EPOLLIN) {
+      // finally sync with criu
+      if (ready_events[i].events & EPOLLIN) {
         ret = recv(client_fd, &cmd, sizeof(cmd), 0);
         if (ret == 0)
-          continue;
+          goto check_next;
         if (REPORT_IF_TRUE(ret != sizeof(cmd)))
           return -1;
         switch (cmd) {
@@ -501,14 +502,27 @@ int RDMAServer::__epoll_buf_sock() {
             return -1;
           if (REPORT_IF_NONZERO(__copy_img_to_buffer_poll(img_fd, pgoff)))
             return -1;
+          ret = send(client_fd, &ack, sizeof(ack), 0);
+          if (ret != sizeof(ack)) {
+            fprintf(stderr, "ack to criu failed\n");
+            return -1;
+          }
           break;
         default:
           fprintf(stderr, "recv unsupport command %d\n", cmd);
           return -1;
         }
       }
+    check_next:
+      if (ready_events[i].events & EPOLLERR) {
+        printf("close client buf_sock %d due to err\n", client_fd);
+        if (REPORT_IF_NONZERO(
+                epoll_ctl(buf_sock_epoll_fd, EPOLL_CTL_DEL, client_fd, NULL)))
+          return -1;
+        close(client_fd);
+      }
       if (ready_events[i].events & (EPOLLHUP | EPOLLRDHUP)) {
-        printf("close client buf_sock %d\n", client_fd);
+        printf("close client buf_sock %d due to hup\n", client_fd);
         if (REPORT_IF_NONZERO(
                 epoll_ctl(buf_sock_epoll_fd, EPOLL_CTL_DEL, client_fd, NULL)))
           return -1;
