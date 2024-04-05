@@ -502,6 +502,9 @@ int RDMAServer::__epoll_buf_sock() {
             return -1;
           if (REPORT_IF_NONZERO(__copy_img_to_buffer_poll(img_fd, pgoff)))
             return -1;
+          // the img_fd has been consumed, remember to close it
+          close(img_fd);
+          img_fd = -1; // prevent it from been used further
           ret = send(client_fd, &ack, sizeof(ack), 0);
           if (ret != sizeof(ack)) {
             fprintf(stderr, "ack to criu failed\n");
